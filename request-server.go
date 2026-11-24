@@ -236,41 +236,55 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 			handle := pkt.getHandle()
 			rpkt = statusFromError(pkt.ID, rs.closeRequest(handle))
 		case *sshFxpRealpathPacket:
-			var realPath string
-			var err error
-
-			switch pather := rs.Handlers.FileList.(type) {
-			case RealPathFileLister:
-				realPath, err = pather.RealPath(pkt.getPath())
-			case legacyRealPathFileLister:
-				realPath = pather.RealPath(pkt.getPath())
-			default:
-				realPath = cleanPathWithBase(rs.startDirectory, pkt.getPath())
+			rpkt = rs.realpathPacket(pkt)
+		case *sshFxpOpendirPacket:
+			request, err := requestFromPacket(ctx, pkt, rs.startDirectory)
+			if err == nil {
+				err = rs.resolveRequest(request)
 			}
 			if err != nil {
 				rpkt = statusFromError(pkt.ID, err)
+				if request != nil {
+					request.close()
+				}
 			} else {
-				rpkt = cleanPacketPath(pkt, realPath)
-			}
-		case *sshFxpOpendirPacket:
-			request := requestFromPacket(ctx, pkt, rs.startDirectory)
-			rpkt = request.opendir(rs.Handlers, pkt)
-			if hpkt, ok := rpkt.(*sshFxpHandlePacket); ok {
-				// Only publish the handle once the Request is fully set up:
-				// a pipelined READ/WRITE on it is handled concurrently.
-				hpkt.Handle = rs.nextRequest(request)
-			} else {
-				request.close()
+				rpkt = request.opendir(rs.Handlers, pkt)
+				if hpkt, ok := rpkt.(*sshFxpHandlePacket); ok {
+					// Only publish the handle once the Request is fully set up:
+					// a pipelined READ/WRITE on it is handled concurrently.
+					hpkt.Handle = rs.nextRequest(request)
+				} else {
+					request.close()
+				}
 			}
 		case *sshFxpOpenPacket:
-			request := requestFromPacket(ctx, pkt, rs.startDirectory)
-			rpkt = request.open(rs.Handlers, pkt)
-			if hpkt, ok := rpkt.(*sshFxpHandlePacket); ok {
-				// Only publish the handle once the Request is fully set up:
-				// a pipelined READ/WRITE on it is handled concurrently.
-				hpkt.Handle = rs.nextRequest(request)
+			request, err := requestFromPacket(ctx, pkt, rs.startDirectory)
+			if err == nil {
+				// A read-only open of the root is allowed; only writes are
+				// refused. The same flags select the Put/Open methods in
+				// request.open().
+				pflags := request.Pflags()
+				if pflags.Write || pflags.Append || pflags.Creat || pflags.Trunc {
+					err = checkRootWritable(request.Filepath, "Open")
+				}
+			}
+			if err == nil {
+				err = rs.resolveRequest(request)
+			}
+			if err != nil {
+				rpkt = statusFromError(pkt.ID, err)
+				if request != nil {
+					request.close()
+				}
 			} else {
-				request.close()
+				rpkt = request.open(rs.Handlers, pkt)
+				if hpkt, ok := rpkt.(*sshFxpHandlePacket); ok {
+					// Only publish the handle once the Request is fully set up:
+					// a pipelined READ/WRITE on it is handled concurrently.
+					hpkt.Handle = rs.nextRequest(request)
+				} else {
+					request.close()
+				}
 			}
 		case *sshFxpFstatPacket:
 			handle := pkt.getHandle()
@@ -278,11 +292,16 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 			if !ok {
 				rpkt = statusFromError(pkt.ID, EBADF)
 			} else {
-				request = &Request{
-					Method:   "Stat",
-					Filepath: cleanPathWithBase(rs.startDirectory, request.Filepath),
+				filepath, err := cleanContainedPath(rs.startDirectory, request.Filepath)
+				if err != nil {
+					rpkt = statusFromError(pkt.ID, err)
+				} else {
+					request = &Request{
+						Method:   "Stat",
+						Filepath: filepath,
+					}
+					rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
 				}
-				rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
 			}
 		case *sshFxpFsetstatPacket:
 			handle := pkt.getHandle()
@@ -290,25 +309,56 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 			if !ok {
 				rpkt = statusFromError(pkt.ID, EBADF)
 			} else {
-				request = &Request{
-					Method:   "Setstat",
-					Filepath: cleanPathWithBase(rs.startDirectory, request.Filepath),
+				filepath, err := cleanContainedPath(rs.startDirectory, request.Filepath)
+				if err != nil {
+					rpkt = statusFromError(pkt.ID, err)
+				} else if err = checkRootWritable(filepath, "Setstat"); err != nil {
+					rpkt = statusFromError(pkt.ID, err)
+				} else {
+					request = &Request{
+						Method:   "Setstat",
+						Filepath: filepath,
+					}
+					rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+				}
+			}
+		case *sshFxpExtendedPacketPosixRename:
+			filepath, err := cleanContainedPath(rs.startDirectory, pkt.Oldpath)
+			if err == nil {
+				var target string
+				target, err = cleanContainedPath(rs.startDirectory, pkt.Newpath)
+				if err == nil {
+					request := &Request{
+						Method:   "PosixRename",
+						Filepath: filepath,
+						Target:   target,
+					}
+					err = checkRootWritable(filepath, "PosixRename")
+					if err == nil {
+						err = checkRootWritable(target, "PosixRename")
+					}
+					if err == nil {
+						err = rs.resolveRequest(request)
+					}
+					if err == nil {
+						rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+					}
+				}
+			}
+			if err != nil {
+				rpkt = statusFromError(pkt.id(), err)
+			}
+		case *sshFxpExtendedPacketStatVFS:
+			filepath, err := cleanContainedPath(rs.startDirectory, pkt.Path)
+			if err != nil {
+				rpkt = statusFromError(pkt.ID, err)
+			} else {
+				request := &Request{
+					Method:   "StatVFS",
+					Filepath: filepath,
 				}
 				rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
 			}
-		case *sshFxpExtendedPacketPosixRename:
-			request := &Request{
-				Method:   "PosixRename",
-				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Oldpath),
-				Target:   cleanPathWithBase(rs.startDirectory, pkt.Newpath),
-			}
-			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
-		case *sshFxpExtendedPacketStatVFS:
-			request := &Request{
-				Method:   "StatVFS",
-				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Path),
-			}
-			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
 		case hasHandle:
 			handle := pkt.getHandle()
 			request, ok := rs.getRequest(handle)
@@ -318,9 +368,24 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
 			}
 		case hasPath:
-			request := requestFromPacket(ctx, pkt, rs.startDirectory)
-			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
-			request.close()
+			request, err := requestFromPacket(ctx, pkt, rs.startDirectory)
+			if err != nil {
+				rpkt = statusFromError(pkt.id(), err)
+			} else {
+				err = checkRootWritable(request.Filepath, request.Method)
+				if err == nil && request.Target != "" {
+					err = checkRootWritable(request.Target, request.Method)
+				}
+				if err == nil {
+					err = rs.resolveRequest(request)
+				}
+				if err != nil {
+					rpkt = statusFromError(pkt.id(), err)
+				} else {
+					rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+				}
+				request.close()
+			}
 		default:
 			rpkt = statusFromError(pkt.id(), ErrSSHFxOpUnsupported)
 		}
@@ -328,6 +393,86 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 		rs.pktMgr.readyPacket(
 			rs.pktMgr.newOrderedResponse(rpkt, orderID))
 	}
+	return nil
+}
+
+// realpathPacket handles SSH_FXP_REALPATH. The built-in lexical
+// implementation preserves its historical clamping semantics (a traversal
+// like "../.." is folded onto the root rather than rejected), while a custom
+// RealPathFileLister result is still containment-checked so backends cannot
+// advertise a location outside the root.
+func (rs *RequestServer) realpathPacket(pkt *sshFxpRealpathPacket) responsePacket {
+	var realPath string
+	var err error
+	custom := false
+
+	switch pather := rs.Handlers.FileList.(type) {
+	case RealPathFileLister:
+		realPath, err = pather.RealPath(pkt.getPath())
+		custom = true
+	case legacyRealPathFileLister:
+		realPath = pather.RealPath(pkt.getPath())
+		custom = true
+	default:
+		realPath = cleanPathWithBase(rs.startDirectory, pkt.getPath())
+	}
+	if err == nil && custom {
+		// Check containment before cleaning so traversal segments cannot be
+		// erased into an apparently in-root path.
+		err = checkContained(filepath.ToSlash(realPath))
+	}
+	if err == nil {
+		// Normalize into a canonical absolute POSIX spelling for the reply.
+		realPath = cleanPath(realPath)
+	}
+	if err != nil {
+		return statusFromError(pkt.ID, err)
+	}
+	return cleanPacketPath(pkt, realPath)
+}
+
+// resolveRequest applies backend provided symbolic link resolution to a
+// request and verifies that the resolved location is still inside the root.
+// It is a no-op when the backend does not implement PathResolver, and for
+// methods that must not follow symbolic links (Lstat, Readlink) or only
+// create them (Symlink, where the target is validated in requestFromPacket).
+func (rs *RequestServer) resolveRequest(r *Request) error {
+	if r.Method == "Lstat" || r.Method == "Readlink" || r.Method == "Symlink" {
+		return nil
+	}
+
+	resolver, ok := rs.Handlers.FileList.(PathResolver)
+	if !ok {
+		return nil
+	}
+
+	resolved, err := resolver.ResolvePath(r.Filepath)
+	if err != nil {
+		return err
+	}
+	// Check containment before cleaning: the resolved path may contain
+	// traversal segments produced by following symbolic links, and cleaning
+	// them first would hide an escape. Once it is proven safe, normalize it
+	// into the canonical spelling backends expect.
+	resolved = filepath.ToSlash(resolved)
+	if err = checkContained(resolved); err != nil {
+		return err
+	}
+	r.Filepath = path.Clean(resolved)
+
+	if r.Target != "" {
+		var target string
+		target, err = resolver.ResolvePath(r.Target)
+		if err != nil {
+			return err
+		}
+		target = filepath.ToSlash(target)
+		if err = checkContained(target); err != nil {
+			return err
+		}
+		r.Target = path.Clean(target)
+	}
+
 	return nil
 }
 

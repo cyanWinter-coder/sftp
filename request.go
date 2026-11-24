@@ -148,6 +148,12 @@ type Request struct {
 	Target   string // for renames and sym-links
 	handle   string
 
+	// symlinkTarget is the verbatim target string from a Symlink request.
+	// Filepath holds the same target cleaned for the containment check, but
+	// backends store the link contents verbatim (and Readlink echoes them),
+	// so the original spelling is kept here.
+	symlinkTarget string
+
 	// attribute flags of an open, where Flags holds the pflags
 	attrFlags uint32
 
@@ -179,7 +185,8 @@ func (r *Request) copy() *Request {
 		Target:   r.Target,
 		handle:   r.handle,
 
-		attrFlags: r.attrFlags,
+		symlinkTarget: r.symlinkTarget,
+		attrFlags:     r.attrFlags,
 
 		state: r.state.copy(),
 
@@ -188,13 +195,49 @@ func (r *Request) copy() *Request {
 	}
 }
 
-// New Request initialized based on packet data
-func requestFromPacket(ctx context.Context, pkt hasPath, baseDir string) *Request {
-	request := &Request{
-		Method:   requestMethod(pkt),
-		Filepath: cleanPathWithBase(baseDir, pkt.getPath()),
-	}
+// New Request initialized based on packet data.
+//
+// Every path carried by the packet is cleaned and re-checked against baseDir
+// here, before any handler runs. A path whose lexical resolution escapes the
+// configured root, or a symbolic link target that would point outside of it,
+// is rejected with a permission error so a single bad request can never reach
+// another tenant's storage. The error is returned to the worker and turned
+// into an SFTP status packet; it never tears down the whole session.
+func requestFromPacket(ctx context.Context, pkt hasPath, baseDir string) (*Request, error) {
+	request := &Request{Method: requestMethod(pkt)}
 	request.ctx, request.cancelCtx = context.WithCancel(ctx)
+
+	// Symlink packets carry two paths with different semantics: getPath()
+	// returns the link target, which is allowed to be relative (and therefore
+	// fails the generic absolute containment check below). Handle it up front
+	// with its own relative-aware validation.
+	if p, ok := pkt.(*sshFxpSymlinkPacket); ok {
+		linkpath, err := cleanContainedPath(baseDir, p.Linkpath)
+		if err != nil {
+			request.cancelCtx()
+			return nil, err
+		}
+		request.Target = linkpath
+
+		// The symbolic link target is stored verbatim by the backend, so
+		// resolve it now and refuse to create links that would lead outside
+		// of the root once followed.
+		target, err := cleanContainedSymlinkTarget(linkpath, p.Targetpath)
+		if err != nil {
+			request.cancelCtx()
+			return nil, err
+		}
+		request.Filepath = target
+		request.symlinkTarget = p.Targetpath
+		return request, nil
+	}
+
+	filepath, err := cleanContainedPath(baseDir, pkt.getPath())
+	if err != nil {
+		request.cancelCtx()
+		return nil, err
+	}
+	request.Filepath = filepath
 
 	switch p := pkt.(type) {
 	case *sshFxpOpenPacket:
@@ -206,16 +249,19 @@ func requestFromPacket(ctx context.Context, pkt hasPath, baseDir string) *Reques
 		request.attrFlags = p.Flags
 		request.Attrs = p.Attrs.([]byte)
 	case *sshFxpRenamePacket:
-		request.Target = cleanPathWithBase(baseDir, p.Newpath)
-	case *sshFxpSymlinkPacket:
-		// NOTE: given a POSIX compliant signature: symlink(target, linkpath string)
-		// this makes Request.Target the linkpath, and Request.Filepath the target.
-		request.Target = cleanPathWithBase(baseDir, p.Linkpath)
-		request.Filepath = p.Targetpath
+		request.Target, err = cleanContainedPath(baseDir, p.Newpath)
+		if err != nil {
+			request.cancelCtx()
+			return nil, err
+		}
 	case *sshFxpExtendedPacketHardlink:
-		request.Target = cleanPathWithBase(baseDir, p.Newpath)
+		request.Target, err = cleanContainedPath(baseDir, p.Newpath)
+		if err != nil {
+			request.cancelCtx()
+			return nil, err
+		}
 	}
-	return request
+	return request, nil
 }
 
 // Context returns the request's context. To change the context,

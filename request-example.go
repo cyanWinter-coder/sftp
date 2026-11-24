@@ -186,8 +186,14 @@ func (fs *root) Filecmd(r *Request) error {
 		return fs.link(r.Filepath, r.Target)
 
 	case "Symlink":
-		// NOTE: r.Filepath is the target, and r.Target is the linkpath.
-		return fs.symlink(r.Filepath, r.Target)
+		// NOTE: r.Filepath is the containment-checked target, and r.Target is
+		// the linkpath. The link itself stores the client's original target
+		// spelling so that Readlink echoes it unchanged.
+		target := r.symlinkTarget
+		if target == "" {
+			target = r.Filepath
+		}
+		return fs.symlink(target, r.Target)
 	}
 
 	return errors.New("unsupported")
@@ -508,6 +514,38 @@ func (fs *root) exists(path string) bool {
 	_, err = fs.lfetch(path)
 
 	return err != os.ErrNotExist
+}
+
+// ResolvePath implements the optional PathResolver interface. It returns the
+// canonical location reached after following the in-memory file system's
+// symbolic links, so the RequestServer can verify that the resolved path
+// stays inside the gateway root.
+//
+// A missing final component (for example the target of a creative open or a
+// dangling symbolic link) is not an error: the existing parent directory is
+// resolved instead and the missing name is re-joined onto it. A missing
+// intermediate component still returns os.ErrNotExist, matching lookups of a
+// real file system.
+func (fs *root) ResolvePath(pathname string) (string, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	file, err := fs.fetch(pathname)
+	if err == nil {
+		return file.name, nil
+	}
+	if err != os.ErrNotExist {
+		return "", err
+	}
+
+	parent, perr := fs.fetch(path.Dir(pathname))
+	if perr != nil {
+		return "", err
+	}
+	if !parent.IsDir() {
+		return "", syscall.ENOTDIR
+	}
+	return path.Join(parent.name, path.Base(pathname)), nil
 }
 
 func (fs *root) fetch(pathname string) (*memFile, error) {
