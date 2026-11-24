@@ -9,11 +9,13 @@ import (
 	"io"
 	"io/fs"
 	"io/ioutil"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -50,14 +52,42 @@ type Server struct {
 	workDir       string
 	winRoot       bool
 	maxTxPacket   uint32
+
+	// Per-connection lifecycle state. These fields are never shared between
+	// Server instances. The anonymous embedding also exposes the internal
+	// per-connection fields to package-local tests and code.
+	*connectionState
+	lifecycle        *connectionState
+	idleConn         *idleTimeoutConn
+	authenticator    Authenticator
+	limiter          *ConnectionLimiter
+	releaseLimiter   func()
+	manager          *ConnectionManager
+	idleTimeout      time.Duration
+	handshakeTimeout time.Duration
+	maxConnections   int
+
+	serveStarted    atomic.Bool
+	lifecycleClosed atomic.Bool
+	cleanupOnce     sync.Once
 }
 
 func (svr *Server) nextHandle(f file) string {
 	svr.openFilesLock.Lock()
-	defer svr.openFilesLock.Unlock()
 	svr.handleCount++
 	handle := strconv.Itoa(svr.handleCount)
+
+	// Close can race with an OPEN already being processed. Once shutdown has
+	// started, do not publish a new handle; close the file immediately so it
+	// cannot outlive the connection.
+	if svr.lifecycleClosed.Load() {
+		svr.openFilesLock.Unlock()
+		_ = f.Close()
+		return handle
+	}
+
 	svr.openFiles[handle] = f
+	svr.openFilesLock.Unlock()
 	return handle
 }
 
@@ -97,21 +127,141 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 			WriteCloser: rwc,
 		},
 	}
+	lifecycleState := newConnectionState()
 	s := &Server{
-		serverConn:  svrConn,
-		debugStream: ioutil.Discard,
-		pktMgr:      newPktMgr(svrConn),
-		openFiles:   make(map[string]file),
-		maxTxPacket: defaultMaxTxPacket,
+		serverConn:      svrConn,
+		debugStream:     ioutil.Discard,
+		pktMgr:          newPktMgr(svrConn),
+		openFiles:       make(map[string]file),
+		maxTxPacket:     defaultMaxTxPacket,
+		connectionState: lifecycleState,
+		lifecycle:       lifecycleState,
+	}
+	if rwc != nil {
+		if addr, ok := rwc.(interface{ RemoteAddr() net.Addr }); ok && addr.RemoteAddr() != nil {
+			s.lifecycle.setRemoteAddr(addr.RemoteAddr().String())
+		}
 	}
 
 	for _, o := range options {
 		if err := o(s); err != nil {
+			_ = s.Close()
 			return nil, err
 		}
 	}
 
+	if err := s.initConnectionLifecycle(rwc); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+
 	return s, nil
+}
+
+// initConnectionLifecycle installs the per-connection idle timer and shared
+// concurrency controls after ServerOptions have been applied.
+func (svr *Server) initConnectionLifecycle(rwc io.ReadWriteCloser) error {
+	initialTimeout := svr.idleTimeout
+	if svr.handshakeTimeout > 0 && (initialTimeout == 0 || svr.handshakeTimeout < initialTimeout) {
+		initialTimeout = svr.handshakeTimeout
+	}
+
+	if initialTimeout > 0 {
+		svr.idleConn = newIdleTimeoutConn(rwc, initialTimeout, func() {
+			debug("sftp idle/handshake timeout closing connection")
+			_ = svr.Close()
+		})
+		svr.idleConn.onActivity = svr.touchActivity
+		svr.conn.Reader = svr.idleConn
+		svr.conn.WriteCloser = svr.idleConn
+		svr.idleConn.start()
+	}
+
+	if svr.limiter != nil {
+		release, err := svr.limiter.Acquire()
+		if err != nil {
+			return err
+		}
+		svr.releaseLimiter = release
+	}
+
+	if svr.manager != nil {
+		if err := svr.manager.attach(svr); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Close actively closes the SFTP transport and immediately releases local
+// resources. Closing the transport notifies the peer through EOF/FIN or the
+// protocol-specific channel close. It is safe to call more than once and safe
+// to call concurrently with Serve.
+func (svr *Server) Close() error {
+	svr.lifecycleClosed.Store(true)
+	var err error
+	if svr.serverConn != nil {
+		err = svr.serverConn.Close()
+	}
+	svr.cleanupConnection()
+	return err
+}
+
+// Disconnect is an alias for Close. Closing the transport notifies the peer.
+func (svr *Server) Disconnect() error {
+	return svr.Close()
+}
+
+func (svr *Server) cleanupConnection() {
+	if svr == nil {
+		return
+	}
+	svr.cleanupOnce.Do(func() {
+		svr.lifecycleClosed.Store(true)
+		if svr.lifecycle != nil {
+			svr.lifecycle.closed()
+		}
+
+		svr.closeAllHandles()
+
+		if svr.pktMgr != nil {
+			// If Serve never started, it cannot reach the packet-manager
+			// shutdown in workerChan. close is Once-protected, so this is
+			// harmless when Serve already performed its own shutdown.
+			if !svr.serveStarted.Load() {
+				svr.pktMgr.close()
+			}
+			if svr.pktMgr.alloc != nil {
+				svr.pktMgr.alloc.Free()
+			}
+		}
+
+		if svr.releaseLimiter != nil {
+			svr.releaseLimiter()
+		}
+		if svr.manager != nil {
+			svr.manager.detach(svr)
+		}
+	})
+}
+
+func (svr *Server) closeAllHandles() {
+	if svr.openFiles == nil {
+		return
+	}
+
+	svr.openFilesLock.Lock()
+	handles := svr.openFiles
+	svr.openFiles = make(map[string]file)
+	svr.openFilesLock.Unlock()
+
+	// Close outside the map lock: a backend Close may call back into the
+	// server and must not deadlock against handle registration.
+	for handle, f := range handles {
+		fmt.Fprintf(svr.debugStream, "sftp server file with handle %q left open: %v\n", handle, f.Name())
+		_ = f.Close()
+	}
 }
 
 // A ServerOption is a function which applies configuration to a Server.
@@ -222,9 +372,17 @@ func handlePacket(s *Server, p orderedRequest) error {
 	orderID := p.orderID()
 	switch p := p.requestPacket.(type) {
 	case *sshFxInitPacket:
+		s.lifecycle.initReceived(p.Version)
 		rpkt = &sshFxVersionPacket{
 			Version:    sftpProtocolVersion,
 			Extensions: sftpExtensions,
+		}
+		s.lifecycle.handshakeCompleted(sftpProtocolVersion)
+		if s.idleConn != nil {
+			// The handshake phase can use a shorter timeout. Once INIT has
+			// been accepted, apply the ordinary idle timeout (or disable the
+			// handshake timer when no idle timeout was configured).
+			s.idleConn.setTimeout(s.idleTimeout)
 		}
 	case *sshFxpStatPacket:
 		// stat the requested file
@@ -378,11 +536,14 @@ func (s *Server) toLocalPath(p string) string {
 // Serve serves SFTP connections until the streams stop or the SFTP subsystem
 // is stopped. It returns nil if the server exits cleanly.
 func (svr *Server) Serve() error {
-	defer func() {
-		if svr.pktMgr.alloc != nil {
-			svr.pktMgr.alloc.Free()
-		}
-	}()
+	if svr.lifecycleClosed.Load() {
+		return net.ErrClosed
+	}
+	svr.serveStarted.Store(true)
+
+	defer svr.cleanupConnection()
+	defer func() { _ = svr.serverConn.Close() }()
+
 	var wg sync.WaitGroup
 	runWorker := func(ch chan orderedRequest) {
 		wg.Add(1)
@@ -422,6 +583,7 @@ recvLoop:
 				//}
 			default:
 				debug("makePacket err: %v", err)
+				svr.lifecycle.handshakeFailed()
 				svr.conn.Close() // shuts down recvPacket
 				break recvLoop
 			}
@@ -433,11 +595,7 @@ recvLoop:
 	close(pktChan) // shuts down sftpServerWorkers
 	wg.Wait()      // wait for all workers to exit
 
-	// close any still-open files
-	for handle, file := range svr.openFiles {
-		fmt.Fprintf(svr.debugStream, "sftp server file with handle %q left open: %v\n", handle, file.Name())
-		file.Close()
-	}
+	// Deferred cleanup closes any handles left open and releases buffers.
 	return err // error from recvPacket
 }
 

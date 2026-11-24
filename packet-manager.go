@@ -13,6 +13,7 @@ type packetManager struct {
 	requests    chan orderedPacket
 	responses   chan orderedPacket
 	fini        chan struct{}
+	closeOnce   sync.Once
 	incoming    orderedPackets
 	outgoing    orderedPackets
 	sender      packetSender // connection object
@@ -102,9 +103,11 @@ func (s *packetManager) readyPacket(pkt orderedResponse) {
 
 // shut down packetManager controller
 func (s *packetManager) close() {
-	// pause until current packets are processed
-	s.working.Wait()
-	close(s.fini)
+	s.closeOnce.Do(func() {
+		// pause until current packets are processed
+		s.working.Wait()
+		close(s.fini)
+	})
 }
 
 // Passed a worker function, returns a channel for incoming packets.

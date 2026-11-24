@@ -17,8 +17,8 @@ type conn struct {
 	alloc      *allocator
 	sync.Mutex // used to serialise writes to sendPacket
 
-	closeOnce  sync.Once
-	closeErr   error
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // the orderID is used in server mode if the allocator is enabled.
@@ -37,9 +37,17 @@ func (c *conn) sendPacket(m encoding.BinaryMarshaler) error {
 }
 
 func (c *conn) Close() error {
-	c.Lock()
-	defer c.Unlock()
+	// Do not take c.Mutex here. It serializes writes and may be held by a
+	// write blocked on a slow or dead peer. Closing the transport below is
+	// what unblocks that write; taking the mutex first could deadlock timely
+	// connection shutdown. closeOnce makes the concurrent Close calls safe.
 	c.closeOnce.Do(func() {
+		// Give transports that support half-close a chance to deliver EOF to
+		// the peer before the full close. Errors are not fatal here; Close
+		// still releases the transport.
+		if closeWrite, ok := c.WriteCloser.(interface{ CloseWrite() error }); ok {
+			_ = closeWrite.CloseWrite()
+		}
 		c.closeErr = c.WriteCloser.Close()
 	})
 	return c.closeErr
