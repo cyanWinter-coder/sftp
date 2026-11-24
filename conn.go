@@ -54,6 +54,12 @@ type clientConn struct {
 	sync.Mutex                          // protects inflight
 	inflight   map[uint32]chan<- result // outstanding requests
 
+	// maxInflight caps the number of requests registered in inflight at once.
+	// A zero value means no limit. The cap is enforced in putChannel, which is
+	// the single point every request registers through, so it covers both the
+	// direct sendPacket path and the concurrent read/write pipelines.
+	maxInflight int
+
 	closed chan struct{}
 	err    error
 }
@@ -95,6 +101,11 @@ func (c *clientConn) Close() error {
 
 // recv continuously reads from the server and forwards responses to the
 // appropriate channel.
+//
+// Replies whose id does not match an outstanding request are discarded after
+// being logged: a duplicate or reordered reply must not be delivered into any
+// other request's buffer. A read or framing error, by contrast, is fatal and
+// ends the loop so every waiter is unblocked by broadcastErr.
 func (c *clientConn) recv() error {
 	defer c.conn.Close()
 
@@ -110,17 +121,18 @@ func (c *clientConn) recv() error {
 
 		ch, ok := c.getChannel(sid)
 		if !ok {
-			// This is an unexpected occurrence. Send the error
-			// back to all listeners so that they terminate
-			// gracefully.
-			return fmt.Errorf("sid not found: %d", sid)
+			// No request with this id is waiting. The reply is either a
+			// duplicate for a request already answered or an out-of-order
+			// stray; dropping it keeps every other request's buffer clean.
+			debug("sftp: dropping response with unknown or duplicate request id: %d", sid)
+			continue
 		}
 
 		ch <- result{typ: typ, data: data}
 	}
 }
 
-func (c *clientConn) putChannel(ch chan<- result, sid uint32) bool {
+func (c *clientConn) putChannel(ch chan<- result, sid uint32) error {
 	c.Lock()
 	defer c.Unlock()
 
@@ -128,12 +140,19 @@ func (c *clientConn) putChannel(ch chan<- result, sid uint32) bool {
 	case <-c.closed:
 		// already closed with broadcastErr, return error on chan.
 		ch <- result{err: connectionLostError(c.err)}
-		return false
+		return connectionLostError(c.err)
 	default:
 	}
 
+	// Reject before registering when the per-connection concurrency limit is
+	// already saturated. Nothing is added to inflight, so the limit can never
+	// be overshot and the caller does not have to clean any state up.
+	if c.maxInflight > 0 && len(c.inflight) >= c.maxInflight {
+		return ErrMaxConcurrentRequests
+	}
+
 	c.inflight[sid] = ch
-	return true
+	return nil
 }
 
 func (c *clientConn) getChannel(sid uint32) (chan<- result, bool) {
@@ -163,7 +182,11 @@ func (c *clientConn) sendPacket(ctx context.Context, ch chan result, p idmarshal
 		ch = make(chan result, 1)
 	}
 
-	c.dispatchRequest(ch, p)
+	if err := c.dispatchRequest(ch, p); err != nil {
+		// The request was rejected before it reached the wire (concurrency
+		// cap or connection already closed); nothing is waiting on ch.
+		return 0, nil, err
+	}
 
 	select {
 	case <-ctx.Done():
@@ -175,19 +198,23 @@ func (c *clientConn) sendPacket(ctx context.Context, ch chan result, p idmarshal
 
 // dispatchRequest should ideally only be called by race-detection tests outside of this file,
 // where you have to ensure two packets are in flight sequentially after each other.
-func (c *clientConn) dispatchRequest(ch chan<- result, p idmarshaler) {
+// It returns without sending anything when the connection is closed or when the
+// per-connection concurrency limit has been reached.
+func (c *clientConn) dispatchRequest(ch chan<- result, p idmarshaler) error {
 	sid := p.id()
 
-	if !c.putChannel(ch, sid) {
-		// already closed.
-		return
+	if err := c.putChannel(ch, sid); err != nil {
+		// already closed, or the concurrency limit was reached.
+		return err
 	}
 
 	if err := c.conn.sendPacket(p); err != nil {
 		if ch, ok := c.getChannel(sid); ok {
 			ch <- result{err: err}
 		}
+		return err
 	}
+	return nil
 }
 
 // broadcastErr sends an error to all goroutines waiting for a response.

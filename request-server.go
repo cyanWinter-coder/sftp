@@ -83,11 +83,16 @@ func NewRequestServer(rwc io.ReadWriteCloser, h Handlers, options ...RequestServ
 			WriteCloser: rwc,
 		},
 	}
+	pktMgr := newPktMgr(svrConn)
+	// A failed response write means the client is gone. Closing the conn
+	// unblocks the read loop and lets Serve drain its workers instead of
+	// queueing responses that can never be delivered.
+	pktMgr.onSendError = func(error) { svrConn.Close() }
 	rs := &RequestServer{
 		Handlers: h,
 
 		serverConn: svrConn,
-		pktMgr:     newPktMgr(svrConn),
+		pktMgr:     pktMgr,
 
 		startDirectory: "/",
 		maxTxPacket:    defaultMaxTxPacket,

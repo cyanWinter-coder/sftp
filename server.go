@@ -104,6 +104,10 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		openFiles:   make(map[string]file),
 		maxTxPacket: defaultMaxTxPacket,
 	}
+	// A failed response write means the client is gone. Closing the conn
+	// unblocks the read loop and lets Serve drain its workers instead of
+	// queueing responses that can never be delivered.
+	s.pktMgr.onSendError = func(error) { s.conn.Close() }
 
 	for _, o := range options {
 		if err := o(s); err != nil {

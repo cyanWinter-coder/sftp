@@ -32,6 +32,12 @@ var (
 	//
 	// Deprecated: please use ErrInternalInconsistency
 	InternalInconsistency = ErrInternalInconsistency
+
+	// ErrMaxConcurrentRequests is returned by a request when the per-connection
+	// limit configured with MaxConcurrentRequests has already been reached.
+	// The rejected request is never sent and no slot is consumed; retrying once
+	// another request has completed is safe.
+	ErrMaxConcurrentRequests = errors.New("sftp: too many concurrent requests on this connection")
 )
 
 // A ClientOption is a function which applies configuration to a Client.
@@ -97,6 +103,24 @@ func MaxConcurrentRequestsPerFile(n int) ClientOption {
 			return errors.New("n must be greater or equal to 1")
 		}
 		c.maxConcurrentRequests = n
+		return nil
+	}
+}
+
+// MaxConcurrentRequests sets a hard limit on the number of requests the Client
+// may have outstanding on the connection at any one time. Once the limit is
+// reached, further requests fail immediately with ErrMaxConcurrentRequests
+// instead of queueing behind the ones already in flight.
+//
+// This bounds resource use (goroutines and reply buffers) when many goroutines
+// share one connection. A value of zero (the default) leaves the number of
+// outstanding requests unlimited.
+func MaxConcurrentRequests(n int) ClientOption {
+	return func(c *Client) error {
+		if n < 0 {
+			return errors.New("n must be greater than or equal to 0")
+		}
+		c.maxInflight = n
 		return nil
 	}
 }
@@ -198,6 +222,7 @@ type Client struct {
 
 	maxPacket             int // max packet size read or written.
 	maxConcurrentRequests int
+	maxInflight           int // hard cap on outstanding requests per connection; 0 means unlimited.
 	nextid                uint32
 
 	// write concurrency is… error prone.
@@ -278,6 +303,10 @@ func newClientPipe(rd, stderr io.Reader, wr io.WriteCloser, wait func() error, o
 			return nil, err
 		}
 	}
+
+	// Surface the configured per-connection concurrency limit on the embedded
+	// connection that putChannel actually enforces.
+	c.clientConn.maxInflight = c.maxInflight
 
 	if stderr != nil {
 		wr := io.Discard
@@ -1360,6 +1389,14 @@ func (f *File) readAt(b []byte, off int64) (int, error) {
 	}
 	workCh := make(chan work)
 
+	type rErr struct {
+		off int64
+		err error
+	}
+	// buffered so a feeder that fails to register a request can report and
+	// exit without depending on the reduce loop having started draining.
+	errCh := make(chan rErr, 1)
+
 	// Slice: cut up the Read into any number of buffers of length <= f.c.maxPacket, and at appropriate offsets.
 	go func() {
 		defer close(workCh)
@@ -1377,12 +1414,16 @@ func (f *File) readAt(b []byte, off int64) (int, error) {
 			id := f.c.nextID()
 			res := resPool.Get()
 
-			f.c.dispatchRequest(res, &sshFxpReadPacket{
+			if err := f.c.dispatchRequest(res, &sshFxpReadPacket{
 				ID:     id,
 				Handle: f.handle,
 				Offset: uint64(offset),
 				Len:    uint32(len(rb)),
-			})
+			}); err != nil {
+				resPool.Put(res)
+				errCh <- rErr{offset, err}
+				return
+			}
 
 			select {
 			case workCh <- work{id, res, rb, offset}:
@@ -1394,12 +1435,6 @@ func (f *File) readAt(b []byte, off int64) (int, error) {
 			b = b[len(rb):]
 		}
 	}()
-
-	type rErr struct {
-		off int64
-		err error
-	}
-	errCh := make(chan rErr)
 
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
@@ -1609,12 +1644,18 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 				next: next,
 			}
 
-			f.c.dispatchRequest(res, &sshFxpReadPacket{
+			if err := f.c.dispatchRequest(res, &sshFxpReadPacket{
 				ID:     id,
 				Handle: f.handle,
 				Offset: uint64(off),
 				Len:    uint32(chunkSize),
-			})
+			}); err != nil {
+				// Feed the failure through the normal work path so the Reduce
+				// loop surfaces it instead of blocking on a missing reply.
+				res <- result{err: err}
+				readCh <- readWork
+				return
+			}
 
 			select {
 			case readCh <- readWork:
@@ -1811,6 +1852,14 @@ func (f *File) writeAtConcurrent(b []byte, off int64) (int, error) {
 
 	pool := newResChanPool(concurrency)
 
+	type wErr struct {
+		off int64
+		err error
+	}
+	// buffered so a feeder that fails to register a request can report and
+	// exit without depending on the reduce loop having started draining.
+	errCh := make(chan wErr, 1)
+
 	// Slice: cut up the Read into any number of buffers of length <= f.c.maxPacket, and at appropriate offsets.
 	go func() {
 		defer close(workCh)
@@ -1828,13 +1877,17 @@ func (f *File) writeAtConcurrent(b []byte, off int64) (int, error) {
 			res := pool.Get()
 			off := off + int64(read)
 
-			f.c.dispatchRequest(res, &sshFxpWritePacket{
+			if err := f.c.dispatchRequest(res, &sshFxpWritePacket{
 				ID:     id,
 				Handle: f.handle,
 				Offset: uint64(off),
 				Length: uint32(len(wb)),
 				Data:   wb,
-			})
+			}); err != nil {
+				pool.Put(res)
+				errCh <- wErr{off, err}
+				return
+			}
 
 			select {
 			case workCh <- work{id, res, off}:
@@ -1845,12 +1898,6 @@ func (f *File) writeAtConcurrent(b []byte, off int64) (int, error) {
 			read += len(wb)
 		}
 	}()
-
-	type wErr struct {
-		off int64
-		err error
-	}
-	errCh := make(chan wErr)
 
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
@@ -1997,7 +2044,9 @@ func (f *File) readFromWithConcurrency(r io.Reader, concurrency int) (read int64
 		off int64
 		err error
 	}
-	errCh := make(chan rwErr)
+	// buffered so a feeder that fails to register a request can report and
+	// exit without depending on the reduce loop having started draining.
+	errCh := make(chan rwErr, 1)
 
 	if concurrency > f.c.maxConcurrentRequests || concurrency < 1 {
 		concurrency = f.c.maxConcurrentRequests
@@ -2022,13 +2071,17 @@ func (f *File) readFromWithConcurrency(r io.Reader, concurrency int) (read int64
 				id := f.c.nextID()
 				res := pool.Get()
 
-				f.c.dispatchRequest(res, &sshFxpWritePacket{
+				if err := f.c.dispatchRequest(res, &sshFxpWritePacket{
 					ID:     id,
 					Handle: f.handle,
 					Offset: uint64(off),
 					Length: uint32(n),
 					Data:   b[:n],
-				})
+				}); err != nil {
+					pool.Put(res)
+					errCh <- rwErr{off, err}
+					return
+				}
 
 				select {
 				case workCh <- work{id, res, off}:

@@ -18,6 +18,18 @@ type packetManager struct {
 	sender      packetSender // connection object
 	working     *sync.WaitGroup
 	packetCount uint32
+	// onSendError, when non-nil, is invoked the first time sender.sendPacket
+	// fails. It is the packetManager's only way to report a write error: the
+	// controller is a single goroutine and cannot return one itself. Servers
+	// wire it to conn.Close so a broken connection is torn down.
+	onSendError func(error)
+	// dead is set by the (single) controller goroutine after the first write
+	// failure. Afterwards responses are only drained and discarded, never
+	// written, so workers are never left blocked on the responses channel.
+	dead bool
+	// deadNotify is closed once, when dead flips to true. Tests synchronize on
+	// it; production code uses onSendError instead.
+	deadNotify chan struct{}
 	// it is not nil if the allocator is enabled
 	alloc *allocator
 }
@@ -28,13 +40,14 @@ type packetSender interface {
 
 func newPktMgr(sender packetSender) *packetManager {
 	s := &packetManager{
-		requests:  make(chan orderedPacket, SftpServerWorkerCount),
-		responses: make(chan orderedPacket, SftpServerWorkerCount),
-		fini:      make(chan struct{}),
-		incoming:  make([]orderedPacket, 0, SftpServerWorkerCount),
-		outgoing:  make([]orderedPacket, 0, SftpServerWorkerCount),
-		sender:    sender,
-		working:   &sync.WaitGroup{},
+		requests:   make(chan orderedPacket, SftpServerWorkerCount),
+		responses:  make(chan orderedPacket, SftpServerWorkerCount),
+		fini:       make(chan struct{}),
+		incoming:   make([]orderedPacket, 0, SftpServerWorkerCount),
+		outgoing:   make([]orderedPacket, 0, SftpServerWorkerCount),
+		sender:     sender,
+		working:    &sync.WaitGroup{},
+		deadNotify: make(chan struct{}),
 	}
 	go s.controller()
 	return s
@@ -162,40 +175,98 @@ func (s *packetManager) controller() {
 		case <-s.fini:
 			return
 		}
+		// Once a write has failed the connection is being torn down, but the
+		// workers still need their responses drained; keep looping until fini.
 		s.maybeSendPackets()
 	}
 }
 
-// send as many packets as are ready
+// maybeSendPackets sends every response whose request has arrived, in request
+// order. After the first write failure the manager switches to draining mode:
+// queued pairs are discarded and every request's allocated pages are returned
+// without touching the broken connection, so workers never block and no buffer
+// leaks. Pages are released off the incoming queue, which works even when the
+// matching response has not been queued yet (or never arrives).
 func (s *packetManager) maybeSendPackets() {
 	for {
-		if len(s.outgoing) == 0 || len(s.incoming) == 0 {
+		if len(s.incoming) == 0 {
 			debug("break! -- outgoing: %v; incoming: %v",
 				len(s.outgoing), len(s.incoming))
-			break
+			return
 		}
-		out := s.outgoing[0]
 		in := s.incoming[0]
-		// debug("incoming: %v", ids(s.incoming))
-		// debug("outgoing: %v", ids(s.outgoing))
-		if in.orderID() == out.orderID() {
-			debug("Sending packet: %v", out.id())
-			s.sender.sendPacket(out.(encoding.BinaryMarshaler))
+
+		// In draining mode drop every request that is queued, whether or not
+		// its response has arrived, returning its pages so nothing is held.
+		if s.dead {
 			if s.alloc != nil {
-				// mark for reuse the slices allocated for this request
 				s.alloc.ReleasePages(in.orderID())
 			}
-			// pop off heads
-			copy(s.incoming, s.incoming[1:])            // shift left
-			s.incoming[len(s.incoming)-1] = nil         // clear last
-			s.incoming = s.incoming[:len(s.incoming)-1] // remove last
-			copy(s.outgoing, s.outgoing[1:])            // shift left
-			s.outgoing[len(s.outgoing)-1] = nil         // clear last
-			s.outgoing = s.outgoing[:len(s.outgoing)-1] // remove last
-		} else {
-			break
+			s.popIncomingHead()
+			if len(s.outgoing) > 0 && s.outgoing[0].orderID() == in.orderID() {
+				s.popOutgoingHead()
+			}
+			continue
+		}
+
+		if len(s.outgoing) == 0 {
+			// No response ready yet for the oldest request; wait for it.
+			return
+		}
+		out := s.outgoing[0]
+		if in.orderID() != out.orderID() {
+			return
+		}
+
+		debug("Sending packet: %v", out.id())
+		if err := s.sender.sendPacket(out.(encoding.BinaryMarshaler)); err != nil {
+			// The connection can no longer carry responses. Switch to draining
+			// mode, release the pages of the request that failed and of
+			// everything queued behind it, then signal the connection tear-down.
+			s.dead = true
+			debug("sftp: failed to send response packet: %v", err)
+			s.dropAllIncoming()
+			s.outgoing = s.outgoing[:0]
+			close(s.deadNotify)
+			if s.onSendError != nil {
+				s.onSendError(err)
+			}
+			return
+		}
+
+		if s.alloc != nil {
+			// mark for reuse the slices allocated for this request
+			s.alloc.ReleasePages(in.orderID())
+		}
+		s.popIncomingHead()
+		s.popOutgoingHead()
+	}
+}
+
+// popIncomingHead removes the oldest queued request.
+func (s *packetManager) popIncomingHead() {
+	copy(s.incoming, s.incoming[1:])            // shift left
+	s.incoming[len(s.incoming)-1] = nil         // clear last
+	s.incoming = s.incoming[:len(s.incoming)-1] // remove last
+}
+
+// popOutgoingHead removes the oldest queued response.
+func (s *packetManager) popOutgoingHead() {
+	copy(s.outgoing, s.outgoing[1:])            // shift left
+	s.outgoing[len(s.outgoing)-1] = nil         // clear last
+	s.outgoing = s.outgoing[:len(s.outgoing)-1] // remove last
+}
+
+// dropAllIncoming returns every queued request's pages to the allocator and
+// empties the incoming ordering queue. It is only called by the controller
+// goroutine when the connection has just failed.
+func (s *packetManager) dropAllIncoming() {
+	if s.alloc != nil {
+		for _, p := range s.incoming {
+			s.alloc.ReleasePages(p.orderID())
 		}
 	}
+	s.incoming = s.incoming[:0]
 }
 
 // func oids(o []orderedPacket) []uint32 {
