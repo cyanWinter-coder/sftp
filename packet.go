@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"reflect"
+
+	sshfx "github.com/pkg/sftp/internal/encoding/ssh/filexfer"
 )
 
 var (
@@ -60,7 +62,35 @@ func marshalFileInfo(b []byte, fi os.FileInfo) []byte {
 	return marshalFileStat(b, flags, fileStat)
 }
 
+// effectiveFileStatFlags returns the flags that actually describe the body
+// marshalFileStat will emit for fileStat. Unknown bits are dropped, and the
+// extended flag is added whenever nanosecond fractions or any other extended
+// attribute have to be carried. Packet headers must use this value so the
+// leading flags word always matches the encoded body.
+func effectiveFileStatFlags(flags uint32, fileStat *FileStat) uint32 {
+	flags &= sshFileXferAttrKnown
+
+	if fileStat == nil {
+		return flags
+	}
+
+	fileStat.syncTimeNsecExtended()
+	if len(fileStat.Extended) > 0 {
+		flags |= sshFileXferAttrExtended
+	}
+
+	return flags
+}
+
 func marshalFileStat(b []byte, flags uint32, fileStat *FileStat) []byte {
+	if fileStat == nil {
+		return b
+	}
+
+	// Resolve the effective flags first so the body emitted here matches the
+	// flags word the packet writes in its header.
+	flags = effectiveFileStatFlags(flags, fileStat)
+
 	if flags&sshFileXferAttrSize != 0 {
 		b = marshalUint64(b, fileStat.Size)
 	}
@@ -69,7 +99,14 @@ func marshalFileStat(b []byte, flags uint32, fileStat *FileStat) []byte {
 		b = marshalUint32(b, fileStat.GID)
 	}
 	if flags&sshFileXferAttrPermissions != 0 {
-		b = marshalUint32(b, fileStat.Mode)
+		mode := fileStat.Mode
+		if mode&uint32(sshfx.ModePerm) == 0 && mode&(s_ISUID|s_ISGID|s_ISVTX) == 0 {
+			// The permissions field is present but carries no permission
+			// bits, so give it an explicit protocol-allowed default while
+			// keeping any file type bits.
+			mode |= defaultFileMode
+		}
+		b = marshalUint32(b, mode)
 	}
 	if flags&sshFileXferAttrACmodTime != 0 {
 		b = marshalUint32(b, fileStat.Atime)
@@ -77,6 +114,9 @@ func marshalFileStat(b []byte, flags uint32, fileStat *FileStat) []byte {
 	}
 
 	if flags&sshFileXferAttrExtended != 0 {
+		// The count describes the pairs actually present, so encoding and
+		// decoding stay in lockstep even when the caller supplied a flag
+		// without populating the slice.
 		b = marshalUint32(b, uint32(len(fileStat.Extended)))
 
 		for _, attr := range fileStat.Extended {
@@ -183,16 +223,21 @@ func unmarshalAttrs(b []byte) (*FileStat, []byte, error) {
 }
 
 func unmarshalFileStat(flags uint32, b []byte) (*FileStat, []byte, error) {
+	// Ignore any flag bit the protocol does not define on this version.
+	// The fields they represent have no wire representation here, so masking
+	// them out lets the known fields still be decoded instead of derailing
+	// the whole packet.
+	knownFlags := flags & sshFileXferAttrKnown
 	var fs FileStat
 	var err error
 
-	if flags&sshFileXferAttrSize == sshFileXferAttrSize {
+	if knownFlags&sshFileXferAttrSize == sshFileXferAttrSize {
 		fs.Size, b, err = unmarshalUint64Safe(b)
 		if err != nil {
 			return nil, b, err
 		}
 	}
-	if flags&sshFileXferAttrUIDGID == sshFileXferAttrUIDGID {
+	if knownFlags&sshFileXferAttrUIDGID == sshFileXferAttrUIDGID {
 		fs.UID, b, err = unmarshalUint32Safe(b)
 		if err != nil {
 			return nil, b, err
@@ -202,13 +247,13 @@ func unmarshalFileStat(flags uint32, b []byte) (*FileStat, []byte, error) {
 			return nil, b, err
 		}
 	}
-	if flags&sshFileXferAttrPermissions == sshFileXferAttrPermissions {
+	if knownFlags&sshFileXferAttrPermissions == sshFileXferAttrPermissions {
 		fs.Mode, b, err = unmarshalUint32Safe(b)
 		if err != nil {
 			return nil, b, err
 		}
 	}
-	if flags&sshFileXferAttrACmodTime == sshFileXferAttrACmodTime {
+	if knownFlags&sshFileXferAttrACmodTime == sshFileXferAttrACmodTime {
 		fs.Atime, b, err = unmarshalUint32Safe(b)
 		if err != nil {
 			return nil, b, err
@@ -218,7 +263,7 @@ func unmarshalFileStat(flags uint32, b []byte) (*FileStat, []byte, error) {
 			return nil, b, err
 		}
 	}
-	if flags&sshFileXferAttrExtended == sshFileXferAttrExtended {
+	if knownFlags&sshFileXferAttrExtended == sshFileXferAttrExtended {
 		var count uint32
 		count, b, err = unmarshalUint32Safe(b)
 		if err != nil {
@@ -250,6 +295,10 @@ func unmarshalFileStat(flags uint32, b []byte) (*FileStat, []byte, error) {
 		}
 		fs.Extended = ext
 	}
+
+	// Lift the nanosecond timestamp fractions out of the extended attributes
+	// into their dedicated fields. Unknown extended types are retained.
+	fs.consumeTimeNsec()
 	return &fs, b, nil
 }
 
@@ -811,18 +860,29 @@ func (p *sshFxpOpenPacket) marshalPacket() ([]byte, []byte, error) {
 	b = marshalUint32(b, p.ID)
 	b = marshalString(b, p.Path)
 	b = marshalUint32(b, p.Pflags)
-	b = marshalUint32(b, p.Flags)
 
 	switch attrs := p.Attrs.(type) {
 	case []byte:
+		// Raw blob: the caller already encoded both the flags and the body,
+		// so emit them verbatim.
+		b = marshalUint32(b, p.Flags)
 		return b, attrs, nil // may as well short-ciruit this case.
 	case os.FileInfo:
 		_, fs := fileStatFromInfo(attrs) // we throw away the flags, and override with those in packet.
+		p.Flags = effectiveFileStatFlags(p.Flags, fs)
+		b = marshalUint32(b, p.Flags)
 		return b, marshalFileStat(nil, p.Flags, fs), nil
 	case *FileStat:
+		p.Flags = effectiveFileStatFlags(p.Flags, attrs)
+		b = marshalUint32(b, p.Flags)
 		return b, marshalFileStat(nil, p.Flags, attrs), nil
+	case nil:
+		// No attributes: still emit the zero flags word the protocol expects.
+		b = marshalUint32(b, p.Flags)
+		return b, nil, nil
 	}
 
+	b = marshalUint32(b, p.Flags)
 	return b, marshal(nil, p.Attrs), nil
 }
 
@@ -1084,18 +1144,28 @@ func (p *sshFxpSetstatPacket) marshalPacket() ([]byte, []byte, error) {
 	b = append(b, sshFxpSetstat)
 	b = marshalUint32(b, p.ID)
 	b = marshalString(b, p.Path)
-	b = marshalUint32(b, p.Flags)
 
 	switch attrs := p.Attrs.(type) {
 	case []byte:
+		// Raw blob: the caller already encoded both the flags and the body.
+		b = marshalUint32(b, p.Flags)
 		return b, attrs, nil // may as well short-ciruit this case.
 	case os.FileInfo:
 		_, fs := fileStatFromInfo(attrs) // we throw away the flags, and override with those in packet.
+		p.Flags = effectiveFileStatFlags(p.Flags, fs)
+		b = marshalUint32(b, p.Flags)
 		return b, marshalFileStat(nil, p.Flags, fs), nil
 	case *FileStat:
+		p.Flags = effectiveFileStatFlags(p.Flags, attrs)
+		b = marshalUint32(b, p.Flags)
 		return b, marshalFileStat(nil, p.Flags, attrs), nil
+	case nil:
+		// No attributes: still emit the flags word the protocol expects.
+		b = marshalUint32(b, p.Flags)
+		return b, nil, nil
 	}
 
+	b = marshalUint32(b, p.Flags)
 	return b, marshal(nil, p.Attrs), nil
 }
 
@@ -1113,18 +1183,28 @@ func (p *sshFxpFsetstatPacket) marshalPacket() ([]byte, []byte, error) {
 	b = append(b, sshFxpFsetstat)
 	b = marshalUint32(b, p.ID)
 	b = marshalString(b, p.Handle)
-	b = marshalUint32(b, p.Flags)
 
 	switch attrs := p.Attrs.(type) {
 	case []byte:
+		// Raw blob: the caller already encoded both the flags and the body.
+		b = marshalUint32(b, p.Flags)
 		return b, attrs, nil // may as well short-ciruit this case.
 	case os.FileInfo:
 		_, fs := fileStatFromInfo(attrs) // we throw away the flags, and override with those in packet.
+		p.Flags = effectiveFileStatFlags(p.Flags, fs)
+		b = marshalUint32(b, p.Flags)
 		return b, marshalFileStat(nil, p.Flags, fs), nil
 	case *FileStat:
+		p.Flags = effectiveFileStatFlags(p.Flags, attrs)
+		b = marshalUint32(b, p.Flags)
 		return b, marshalFileStat(nil, p.Flags, attrs), nil
+	case nil:
+		// No attributes: still emit the flags word the protocol expects.
+		b = marshalUint32(b, p.Flags)
+		return b, nil, nil
 	}
 
+	b = marshalUint32(b, p.Flags)
 	return b, marshal(nil, p.Attrs), nil
 }
 

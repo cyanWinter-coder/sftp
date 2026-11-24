@@ -659,12 +659,17 @@ func (c *Client) setstat(path string, flags uint32, attrs any) error {
 }
 
 // Chtimes changes the access and modification times of the named file.
+//
+// The timestamps are encoded as epoch seconds plus separate nanosecond
+// fractions. Both are zone independent, so the local time zone of either the
+// client or server has no effect on the resulting timestamps.
 func (c *Client) Chtimes(path string, atime time.Time, mtime time.Time) error {
-	type times struct {
-		Atime uint32
-		Mtime uint32
+	attrs := &FileStat{
+		Atime:     uint32(atime.Unix()),
+		Mtime:     uint32(mtime.Unix()),
+		AtimeNsec: uint32(atime.Nanosecond()),
+		MtimeNsec: uint32(mtime.Nanosecond()),
 	}
-	attrs := times{uint32(atime.Unix()), uint32(mtime.Unix())}
 	return c.setstat(path, sshFileXferAttrACmodTime, attrs)
 }
 
