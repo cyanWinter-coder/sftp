@@ -14,11 +14,15 @@ type conn struct {
 	io.Reader
 	io.WriteCloser
 	// this is the same allocator used in packet manager
-	alloc      *allocator
+	alloc *allocator
+
+	// bufs accounts for the transfer buffers this connection borrows from the
+	// shared pool, so that closing the connection returns all of them.
+	bufs       *connBufPool
 	sync.Mutex // used to serialise writes to sendPacket
 
-	closeOnce  sync.Once
-	closeErr   error
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // the orderID is used in server mode if the allocator is enabled.
@@ -40,6 +44,13 @@ func (c *conn) Close() error {
 	c.Lock()
 	defer c.Unlock()
 	c.closeOnce.Do(func() {
+		// Return the transfer buffers this connection holds before the
+		// transport goes away. Cached buffers go back to the shared pool;
+		// buffers a transfer still has checked out are accounted as returned
+		// by close and reclaimed by that transfer's lease as it unwinds.
+		if c.bufs != nil {
+			c.bufs.close()
+		}
 		c.closeErr = c.WriteCloser.Close()
 	})
 	return c.closeErr

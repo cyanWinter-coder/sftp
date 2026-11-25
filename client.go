@@ -101,6 +101,23 @@ func MaxConcurrentRequestsPerFile(n int) ClientOption {
 	}
 }
 
+// BufferPoolLimit sets how many transfer buffers this connection may hold at
+// once. Buffers are borrowed from a shared, size-classed pool and returned
+// when a transfer finishes or the connection closes.
+//
+// When the limit is reached, a transfer that needs another buffer waits until
+// one is returned; it does not allocate past the limit. A value of zero (the
+// default) uses the package default.
+func BufferPoolLimit(n int) ClientOption {
+	return func(c *Client) error {
+		if n < 0 {
+			return errors.New("n must be greater than or equal to 0")
+		}
+		c.bufPoolLimit = n
+		return nil
+	}
+}
+
 // ForceSingleFile restricts the client to one open file or directory at a time.
 // A second open returns an SSH_FX_FAILURE status until the current handle is closed.
 // Use this with servers that return the same handle for multiple opens:
@@ -198,6 +215,7 @@ type Client struct {
 
 	maxPacket             int // max packet size read or written.
 	maxConcurrentRequests int
+	bufPoolLimit          int // max transfer buffers held at once; 0 uses the default.
 	nextid                uint32
 
 	// write concurrency is… error prone.
@@ -278,6 +296,10 @@ func newClientPipe(rd, stderr io.Reader, wr io.WriteCloser, wait func() error, o
 			return nil, err
 		}
 	}
+
+	// Surface the configured per-connection buffer limit on the embedded
+	// connection, whose Close returns any buffers still checked out.
+	c.clientConn.conn.bufs = newConnBufPool(defaultBufferPool, c.bufPoolLimit)
 
 	if stderr != nil {
 		wr := io.Discard
@@ -1480,9 +1502,44 @@ func (f *File) readAt(b []byte, off int64) (int, error) {
 	return len(b), nil
 }
 
+// transferBufferLease starts a lease on this connection's transfer buffers.
+// Ending the lease returns every buffer it still holds.
+func (c *Client) transferBufferLease() *bufferLease {
+	return newBufferLease(c.clientConn.conn.bufs)
+}
+
+// capTransferConcurrency bounds the concurrency of a read transfer by the
+// number of buffers the connection may hold. A concurrent read keeps one
+// buffer per in-flight request, so more workers than the limit would only make
+// them queue on each other for buffers.
+func (c *Client) capTransferConcurrency(n int) int {
+	if limit := c.clientConn.conn.bufs.limit(); limit > 0 && n > limit {
+		n = limit
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// BufferPoolStats returns a snapshot of this connection's transfer buffer
+// usage: how many buffers it has borrowed and returned, how many transfers
+// currently hold, and how many it keeps for reuse.
+func (c *Client) BufferPoolStats() ConnBufferPoolStats {
+	return c.clientConn.conn.bufs.stats()
+}
+
 // writeToSequential implements WriteTo, but works sequentially with no parallelism.
 func (f *File) writeToSequential(w io.Writer) (written int64, err error) {
-	b := make([]byte, f.c.maxPacket)
+	lease := f.c.transferBufferLease()
+	defer lease.release()
+
+	buf, err := lease.get(f.c.maxPacket)
+	if err != nil {
+		return 0, err
+	}
+	b := buf.b
+
 	ch := make(chan result, 1) // reusable channel
 
 	for {
@@ -1553,10 +1610,11 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 		concurrency64 = uint64(f.c.maxConcurrentRequests)
 	}
 	// Now that concurrency64 is saturated to an int value, we know this assignment cannot possibly overflow.
-	concurrency := int(concurrency64)
+	concurrency := f.c.capTransferConcurrency(int(concurrency64))
 
 	chunkSize := f.c.maxPacket
-	pool := newBufPool(concurrency, chunkSize)
+	lease := f.c.transferBufferLease()
+
 	resPool := newResChanPool(concurrency)
 
 	cancel := make(chan struct{})
@@ -1568,10 +1626,15 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 		// We want to wait until all outstanding goroutines with an `f` or `f.c` reference have completed.
 		// Just to be sure we don’t orphan any goroutines any hanging references.
 		wg.Wait()
+
+		// Return any buffer the transfer still holds, including buffers
+		// checked out by workers that observed the connection closing.
+		lease.release()
 	}()
 
 	type writeWork struct {
 		b   []byte
+		buf *buffer
 		off int64
 		err error
 
@@ -1584,18 +1647,45 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 		res chan result
 		off int64
 
+		buf *buffer
+
 		cur, next chan writeWork
 	}
 	readCh := make(chan readWork)
 
 	// Slice: hand out chunks of work on demand, with a `cur` and `next` channel built-in for sequencing.
+	//
+	// The buffer for each chunk is taken here, in chunk order, before the
+	// chunk is handed to a worker. A worker must not have to wait for a buffer
+	// while holding an earlier chunk's result: the reduce phase consumes
+	// chunks strictly in order, so a worker blocked on a buffer could be
+	// holding the result the reduce phase needs to make progress and free it.
+	//
+	// The feeder is part of the wait group so the connection is never asked
+	// for a buffer after the transfer has returned its buffers.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		defer close(readCh)
 
 		off := f.offset
 
 		cur := writeCh
 		for {
+			buf, err := lease.getWithCancel(chunkSize, cancel)
+			if err != nil {
+				if errors.Is(err, errBufferPoolCanceled) {
+					return
+				}
+				// Surface capacity failures through the ordered pipeline so
+				// the caller sees them at the right offset.
+				select {
+				case cur <- writeWork{off: off, err: err, next: nil}:
+				case <-cancel:
+				}
+				return
+			}
+
 			id := f.c.nextID()
 			res := resPool.Get()
 
@@ -1604,6 +1694,7 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 				id:  id,
 				res: res,
 				off: off,
+				buf: buf,
 
 				cur:  cur,
 				next: next,
@@ -1619,6 +1710,8 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 			select {
 			case readCh <- readWork:
 			case <-cancel:
+				// Nobody will consume this chunk, so return its buffer.
+				lease.put(buf)
 				return
 			}
 
@@ -1634,7 +1727,9 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 			defer wg.Done()
 
 			for readWork := range readCh {
-				var b []byte
+				// Start empty: a reply that carries no data must not cause
+				// the reduce phase to write the buffer's untouched bytes.
+				b := readWork.buf.b[:0]
 				var n int
 
 				s := <-readWork.res
@@ -1654,7 +1749,7 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 							// requested (up to the packet limit, larger than the
 							// pool buffer); copy bounds it to the buffer size
 							// rather than slicing past the page and panicking.
-							b = pool.Get()
+							b = readWork.buf.b[:len(readWork.buf.b)]
 							n = copy(b, data)
 							b = b[:n]
 						}
@@ -1666,6 +1761,7 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 
 				writeWork := writeWork{
 					b:   b,
+					buf: readWork.buf,
 					off: readWork.off,
 					err: err,
 
@@ -1696,6 +1792,9 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 
 		if len(packet.b) > 0 {
 			n, err := w.Write(packet.b)
+			// The read data is fully consumed; return the buffer now rather
+			// than keeping it until the transfer ends.
+			lease.put(packet.buf)
 			written += int64(n)
 			if err != nil {
 				return written, err
@@ -1710,7 +1809,6 @@ func (f *File) WriteTo(w io.Writer) (written int64, err error) {
 			return written, packet.err
 		}
 
-		pool.Put(packet.b)
 		cur = packet.next
 	}
 }
@@ -1811,6 +1909,8 @@ func (f *File) writeAtConcurrent(b []byte, off int64) (int, error) {
 
 	pool := newResChanPool(concurrency)
 
+	var wg sync.WaitGroup
+
 	// Slice: cut up the Read into any number of buffers of length <= f.c.maxPacket, and at appropriate offsets.
 	go func() {
 		defer close(workCh)
@@ -1852,7 +1952,6 @@ func (f *File) writeAtConcurrent(b []byte, off int64) (int, error) {
 	}
 	errCh := make(chan wErr)
 
-	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		// Map_i: each worker gets work, and does the Write from each buffer to its respective offset.
@@ -2005,11 +2104,30 @@ func (f *File) readFromWithConcurrency(r io.Reader, concurrency int) (read int64
 
 	pool := newResChanPool(concurrency)
 
+	var wg sync.WaitGroup
+
+	lease := f.c.transferBufferLease()
+	defer func() {
+		// Hold the lease until the feeder has stopped, so it cannot ask for a
+		// buffer after the transfer gave its buffers back.
+		wg.Wait()
+		lease.release()
+	}()
+
 	// Slice: cut up the Read into any number of buffers of length <= f.c.maxPacket, and at appropriate offsets.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		defer close(workCh)
 
-		b := make([]byte, f.c.maxPacket)
+		buf, err := lease.get(f.c.maxPacket)
+		if err != nil {
+			if !errors.Is(err, errBufferPoolCanceled) {
+				errCh <- rwErr{f.offset, err}
+			}
+			return
+		}
+		b := buf.b
 		off := f.offset
 
 		for {
@@ -2048,7 +2166,6 @@ func (f *File) readFromWithConcurrency(r io.Reader, concurrency int) (read int64
 		}
 	}()
 
-	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		// Map_i: each worker gets work, and does the Write from each buffer to its respective offset.
@@ -2190,7 +2307,17 @@ func (f *File) ReadFrom(r io.Reader) (int64, error) {
 
 	ch := make(chan result, 1) // reusable channel
 
-	b := make([]byte, f.c.maxPacket)
+	lease := f.c.transferBufferLease()
+	defer lease.release()
+
+	buf, err := lease.get(f.c.maxPacket)
+	if err != nil {
+		return 0, err
+	}
+	b := buf.b
+	// The buffer is reused for every chunk and returned once the transfer
+	// ends, whatever path it takes.
+	defer lease.put(buf)
 
 	var read int64
 	for {
